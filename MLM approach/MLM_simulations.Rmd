@@ -1,0 +1,196 @@
+
+---
+title: "MLM Simulations"
+output: html_document
+date: "2024-01-04"
+---
+
+```{r}
+library(MASS)
+library(lme4)
+library(nlme)
+library(tidyverse)
+library(parallel)
+library(doParallel)
+library(foreach)
+library(gee)
+```
+
+```{r}
+# Parallel running
+if (length(showConnections()) > 0) closeAllConnections()
+ncores=detectCores()
+cl <- makeCluster(ncores)  
+registerDoParallel(cl)
+```
+
+
+```{r}
+# Correlation structure
+# Exchangeable
+exch_cor <- function(n, sigma, rho){
+  covmat <- rho * outer(sigma, sigma, `*`)
+  diag(covmat) <- sigma^2
+  return(covmat)
+}
+
+# AR1
+ar1_cor <- function(n, sigma, rho){
+  rhomat <- rho^abs(outer(1:n, 1:n, `-`))
+  covmat <- rhomat*outer(sigma, sigma, `*`)
+  diag(covmat) <- sigma^2
+  return(covmat)
+}
+
+# Correlation term (alpha3)
+corr_term = function(numer, denom){
+  return(numer/denom)
+}
+
+# Convert data to long (full) configuration
+# Scale baseline value and center time
+convert_long = function(id, time1, y, p){
+  datay = data.frame(id, time1, y)
+  y1 = rep(datay[datay$time1==0,]$y, each=p)
+
+  ydata_long = datay %>% 
+    mutate(y1=y1) %>% 
+    mutate(y.1 = scale(y1)[,1]) %>% 
+    mutate(timec = time1 - mean(time1))
+  return(ydata_long)
+}
+```
+
+# Write simulation into a whole function
+
+```{r}
+# n: sample size
+# p: number of observations per subject
+# nsim: number of simulations
+# alpha: parameter of fixed effects
+# D: Covariance matrix of random effect
+# R: Covariance matrix of residuals
+# convert_long: function that converts data to long (full) configuration
+
+# Function used to get correlation between random intercept and random slope by applying the MLM approach through simulations
+corr_sim <- function(n,p,nsim, alpha, D, R, convert_long){
+
+id = rep(1:n, each=p)
+time1 = rep((0:(p-1)),n)
+
+# Fixed effect `alpha` in equation 3.1.
+# `t` represents treatment group and `c` represents control group
+alpha_t=alpha$alpha_t
+alpha_c=alpha$alpha_c
+
+if (is.null(alpha_t) & is.null(alpha_c)){
+  stop("Please specify fixed effect.")
+} else if (is.null(alpha_t)){
+  alpha_t = alpha_c
+} else if (is.null(alpha_c)){
+  alpha_c = alpha_t
+}
+
+# Covariance matrix `D` of random effect `b` in equation 3.1.
+# `t` represents treatment group and `c` represents control group
+D_t = D$D_t
+D_c = D$D_c
+
+if (is.null(D_t) & is.null(D_c)){
+  stop("Please specify covariance matrix of random effect.")
+} else if (is.null(D_t)){
+  D_t = D_c
+} else if (is.null(D_c)){
+  D_c = D_t
+}
+
+# Covariance matrix `R` of residuals `e` in equation 3.1.
+# `t` represents treatment group and `c` represents control group
+R_t = R$R_t
+R_c = R$R_c
+
+if (ncol(R_t) != p | ncol(R_c) != p){
+  stop("The dimension of covariance matrix of residuals is not equal to the number of observations per subjects.")
+}
+
+if (is.null(R_t) & is.null(R_c)){
+  stop("Please specify covariance matrix of residuals.")
+} else if (is.null(R_t)){
+  R_t = R_c
+} else if (is.null(R_c)){
+  R_c = R_t
+}
+
+# Treatment indicator (1: Treatment, 0: Control)
+tx=rep(c(1,0), each=(p*n))
+  
+beta <- matrix(NA, nsim, 1)
+
+beta <- foreach (i = 1:nsim, .combine=rbind, .packages=c("dplyr","tidyverse", "MASS", "gee", "lme4")) %dopar% {
+
+  Zt = mvrnorm(n, c(0,0), D_t)
+  b0it=Zt[,1] # Random intercepts in treatment group 
+  b1it=Zt[,2] # Random slopes in treatment group
+  
+  Zc = mvrnorm(n, c(0,0), D_c)
+  b0ic=Zc[,1] # Random intercepts in control group
+  b1ic=Zc[,2] # Random slopes in control group
+
+  epsilon_t = mvrnorm(n, rep(0,p), R_t) # Residuals in treatment group
+  epsilon_c = mvrnorm(n, rep(0,p), R_c) # Residuals in control group
+  
+  # Create response values for treatment and control group
+  yt = (alpha_t[1]+b0it[id]) + (alpha_t[2]+b1it[id])*time1 + c(t(epsilon_t))
+  yc = (alpha_c[1]+b0ic[id]) + (alpha_c[2]+b1ic[id])*time1 + c(t(epsilon_c))
+  
+  # Convert data to long (full) configuration for treatment group
+  ydata_long = convert_long(id,time1,yt,p)
+
+  # Fit linear mixed effect model with intercept and centered time as covariates to data from treatment group
+  obj <- lmer(y ~ timec + (1+timec|id), data=ydata_long, REML=FALSE)
+  
+  # Get correlation between random intercept and random slope
+  corr=attr(summary(obj)$varcor$id, "correlation")[1,2]
+  
+  c(corr)
+}
+
+mean=colMeans(beta) 
+st_dev=apply(beta, 2, sd)
+
+result = rbind(mean,st_dev)
+return(result)
+}
+```
+
+
+# For Reference Scenario (Scenario 1)
+```{r}
+# Fixed effect `alpha` in equation 3.1.
+alpha_t = c(55,4)
+alpha_c = c(55,2)
+
+# Covariance matrix `D` of random effect `b` in equation 3.1.
+sigma_int_t = 5.5
+sigma_int_c = 5.5
+sigma_time1_t = 3.5
+sigma_time1_c = 3.5
+corr_t = 0.3
+corr_c = 0.5
+D_t = matrix(c(sigma_int_t^2, corr_t*sigma_int_t*sigma_time1_t, corr_t*sigma_int_t*sigma_time1_t, sigma_time1_t^2), nrow=2)
+D_c = matrix(c(sigma_int_c^2, corr_c*sigma_int_c*sigma_time1_c, corr_c*sigma_int_c*sigma_time1_c, sigma_time1_c^2), nrow=2)
+
+# Covariance matrix `R` of residuals `e` in equation 3.1.
+p=3
+sd_t <- rep(2,p)
+rho_t <- 0.3
+sd_c = rep(2,p)
+rho_c = 0.3
+R_t=ar1_cor(p,sd_t,rho_t)
+R_c=ar1_cor(p,sd_c,rho_c)
+```
+
+```{r}
+# Correlation between random intercept and random slope by applying the MLM Approach
+corr_sim(n=200,p=3,nsim=1000, alpha=list(alpha_t=alpha_t, alpha_c=alpha_c), D=list(D_t=D_t, D_c=D_c), R=list(R_t=R_t, R_c=R_c), convert_long)
+```
