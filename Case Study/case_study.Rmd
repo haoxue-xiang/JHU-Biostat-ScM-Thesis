@@ -1,0 +1,390 @@
+---
+title: "Case Study"
+output: html_document
+date: "2024-02-26"
+---
+
+```{r}
+library(MASS)
+library(lme4)
+library(nlme)
+library(tidyverse)
+library(parallel)
+library(doParallel)
+library(foreach)
+library(gee)
+library(twang)
+```
+
+# Prepare dataset
+```{r}
+# Read dataset
+TKR_dat <- read_csv("FORCE_Data_for_JHU.csv")
+OAI_dat <- read_csv("OAI_24m.csv")
+```
+
+```{r, echo=FALSE}
+# Prepare data
+# Filter the data to make sure ages are between 60 and 80 and baseline values are not missing for TKR and OAI group 
+TKR_dat_2 = TKR_dat %>% 
+  select(patient_id, age, pre_pcs, post12m_pcs, post24m_pcs) %>% 
+  rename(id=patient_id, y1=pre_pcs, y2=post12m_pcs, y3=post24m_pcs) %>% 
+  mutate(study=1) %>% 
+  filter(age >= 60 & age <= 80) %>% 
+  filter(!is.na(y1))
+
+OAI_dat_2 = OAI_dat %>% 
+  select(ID, V00AGE, V00HSPSS, V01HSPSS, V03HSPSS) %>% 
+  rename(id=ID, age=V00AGE, y1=V00HSPSS, y2=V01HSPSS, y3=V03HSPSS) %>% 
+  mutate(study=0) %>% 
+  filter(age >= 60 & age <= 80) %>% 
+  filter(!is.na(y1))
+```
+
+# Exploratory data analysis
+```{r}
+# Make Spaghetti plot of PCS against Year for TKR group overlaid by linear regression trend line (sample 200 subjects from TKR group to plot)
+sample_id = sample(TKR_dat_2$id, 200, replace=FALSE)
+
+TKR_dat_plot = TKR_dat_2 %>% 
+  select(-c(age, study)) %>% 
+  pivot_longer(-id, names_to = "visit", values_to = "y") %>% 
+  mutate(year = case_when(visit == "y1"~0,
+                          visit == "y2"~1,
+                          visit == "y3"~2)) %>% 
+  filter(id %in% sample_id)
+
+ggplot()+
+  geom_line(aes(x=year,y=y,group=id), data=TKR_dat_plot, alpha=0.2)+
+  geom_smooth(aes(x=year,y=y),data=TKR_dat_plot, method=lm, formula=y~x, se=TRUE, col="red")+
+  labs(x = "Year", y = "PCS")+
+  scale_x_continuous(breaks=c(0,1,2))+
+  theme_bw()
+
+ggsave("speg_plot_tkr.png")
+```
+
+```{r}
+# Make Spaghetti plot of PCS against Year for TKR (blue) and OAI (red) group overlaid by linear regression line separately (sample 400 subjects in total from TKR and OAI group)
+dat_total = rbind(TKR_dat_2, OAI_dat_2)
+sample_id = sample(dat_total$id, 400, replace=FALSE)
+
+total_dat_plot = dat_total %>% 
+  pivot_longer(-c(id,age,study), names_to = "visit", values_to = "y") %>% 
+  mutate(year = case_when(visit == "y1"~0,
+                          visit == "y2"~1,
+                          visit == "y3"~2)) %>% 
+  filter(id %in% sample_id)
+
+total_dat_plot %>% ggplot()+
+  geom_line(aes(x=year,y=y,group=id,col=factor(study)), alpha=0.2)+
+  geom_smooth(aes(x=year,y=y,col=factor(study)), method=lm, formula=y~x, se=TRUE)+
+  theme_bw()
+
+#ggsave('speg_plot.png')  
+```
+
+```{r}
+# Make Spaghetti plot of PCS against Year for TKR (red) group and OAI (blue) group overlaid by linear regression trend lines and stratified by low (solid) and high (dotted) pre-PCS (sample 600 subjects in total from TKR and OAI group) 
+set.seed(456)
+dat_total = rbind(TKR_dat_2, OAI_dat_2)
+y1_med = median(dat_total$y1)
+
+dat_total_str = dat_total %>% 
+  mutate(group = ifelse(y1 <= y1_med, "Low pre-PCS", "High pre-PCS"))
+
+sample_id = sample(dat_total$id, 600, replace=FALSE)
+
+total_dat_plot = dat_total_str %>% 
+  pivot_longer(-c(id,age,study,group), names_to = "visit", values_to = "y") %>% 
+  mutate(year = case_when(visit == "y1"~0,
+                          visit == "y2"~1,
+                          visit == "y3"~2)) %>% 
+  filter(id %in% sample_id) %>% 
+  mutate(study=as.factor(study), group=as.factor(group))
+
+total_dat_plot$group = factor(total_dat_plot$group, levels=c('Low pre-PCS', 'High pre-PCS'))
+
+total_dat_plot$study = factor(total_dat_plot$study, levels=c(1,0))
+
+total_dat_plot %>% ggplot()+
+  #facet_wrap(.~group, ncol=2, scales="free_y")+
+  geom_line(aes(x=year,y=y,group=id,col=study, linetype=group), alpha=0.08)+
+  geom_smooth(aes(x=year,y=y,col=study, linetype=group), method=lm, formula=y~x, se=FALSE, size=1.3)+
+  scale_color_manual(values = c("red","blue"), breaks=c(1,0), labels = c("TKR", "OAI"), name="Study")+
+  scale_linetype_discrete(name="Group")+
+  scale_x_continuous(breaks=c(0,1,2))+
+  labs(x = "Year", y = "PCS")+
+  theme_bw()
+
+ggsave('speg_plot_str.png')
+```
+
+# Naive estimate of baseline-time interaction
+
+```{r}
+p=3
+
+# Combine data from TKR and OAI group
+dat_total = data.frame(rbind(TKR_dat_2, OAI_dat_2))
+
+# Covert total data to long (full) configuration
+# Center baseline value and time (year)
+dat_total_2 = dat_total %>% 
+  pivot_longer(c(y1,y2,y3), names_to = "visit", values_to = "y") %>% 
+  mutate(year = case_when(visit == "y1"~0,
+                          visit == "y2"~1,
+                          visit == "y3"~2))
+y1 = rep(dat_total_2[dat_total_2$year==0,]$y, each=p)
+
+dat_total_3 = dat_total_2 %>% 
+  mutate(y1=y1) %>% 
+  mutate(y1c = y1-mean(y1)) %>% 
+  mutate(yearc=year-mean(year))
+```
+
+```{r}
+# Get naive estimate of time-baseline interaction using data from TKR group
+TKR_dat_naive = dat_total_3 %>% filter(study==1)
+
+mod.naive = gee(y~yearc*y1c, data=TKR_dat_naive, id=id, corstr = "exchangeable")
+beta.naive_tkr=coef(mod.naive)[4]
+beta.naive_tkr #-0.284
+```
+
+```{r}
+# Perform clustered bootstrapping to derive 95% confidence interval for naive estimate (1000 bootstrapped sample)
+library(boot)
+
+wide_TKR_dat_naive = TKR_dat_naive %>% 
+  select(id, y, y1c, yearc) %>% 
+  pivot_wider(id_cols=id,values_from = c(y, y1c),names_from=yearc)
+
+## Write a bootstrap function 
+my.boot <- function(data, id){
+  # Resample the subjects
+  dt <- data[id, ]
+  # Create a new id variable and drop the old id
+  dt$id = NULL
+  dt$id = seq(1,nrow(dt))
+  # Convert to the long format for model fitting
+  dlong0 = pivot_longer(dt,cols=!id,
+                    names_to=c("vars","yearc"),
+                    names_sep="_",values_to = "y") %>% 
+    mutate(yearc=as.numeric(yearc))
+  dlong = pivot_wider(dlong0,names_from="vars",values_from="y")
+  # Fit the mean model
+  fit = lm(y~yearc*y1c, data=dlong)
+  coef(fit)[4]
+}
+
+set.seed(123)
+result = boot(wide_TKR_dat_naive, my.boot, 1000)
+
+boot_ci <- boot.ci(result, type = "perc")$perc[4:5]
+boot_ci # -0.299, -0.264
+```
+
+# Weight data from TKR and OAI group by propensity score approach
+```{r, echo=FALSE}
+# Fit propensity score model to match data from TKR and OAI group with baseline value and age as predictors
+prop_obj = ps(study ~ y1+age, 
+             data=dat_total,
+             interaction.depth = 2,
+             shrinkage = 0.001,
+             estimand = "ATT",
+             stop.method = c("es.mean"),
+             n.trees =10000)
+```
+
+```{r}
+# Diagnostic analysis of propensity score model
+plot(prop_obj, type="b")
+summary(prop_obj)
+bal.table(prop_obj)
+```
+
+```{r}
+# Show distributions of baseline value before/after weighting by propensity score
+ggplot(dat_total) +
+  geom_density(aes(x=y1, col=as.factor(study)), bw=5, alpha=0.5) +
+  scale_color_discrete(name = "Study", breaks=c(1,0),  labels = c("TKR", "OAI"))+
+  labs(x = "Pre-PCS", y = "Density")+
+  theme_bw()
+
+ggsave("before_match.png")
+
+ggplot(dat_total) +
+  geom_density(aes(x=y1, col =as.factor(study), weight = prop_obj$w$es.mean.ATT), bw=5, alpha=0.5) +
+  scale_color_discrete(name = "Study", breaks=c(1,0),  labels = c("TKR", "OAI"))+
+  labs(x = "Pre-PCS", y = "Density")+
+  theme_bw()
+
+ggsave("after_match.png")
+```
+
+# k after weighting
+```{r}
+# Use propensity score weight to calculate k by generating weighted covariance between baseline*time and response for TKR and OAI group and then divided them
+dat_total_4 = dat_total_3 %>% 
+  mutate(prop_weight=rep(prop_obj$w$es.mean.ATT, each=p))
+
+dat_total_5 = dat_total_4 %>% 
+  mutate(y1_t = y1c*yearc)
+
+TKR_new = dat_total_5 %>% 
+  filter(study==1, !is.na(y))
+
+OAI_new = dat_total_5 %>% 
+  filter(study==0, !is.na(y))
+
+cov_y1t_y_tkr = cov.wt(cbind(TKR_new$y1_t, TKR_new$y), wt = TKR_new$prop_weight)$cov[1,2]
+cov_y1t_y_oai= cov.wt(cbind(OAI_new$y1_t, OAI_new$y), wt = OAI_new$prop_weight)$cov[1,2]
+
+k = cov_y1t_y_oai/cov_y1t_y_tkr
+k
+```
+
+# Corrected estimate of baseline-time interaction 
+```{r}
+# Derive corrected estimate of baseline-time interaction using data from TKR group and `k`
+TKR_dat_naive2=TKR_dat_naive %>% 
+  mutate(y1_t = y1c*yearc) %>% 
+  select(-visit)
+  
+cov_tkr_y1t_y = cov(TKR_dat_naive2, use="pairwise.complete.obs")["y1_t", "y"]
+cov_tkr_y1t_y1t = cov(TKR_dat_naive2, use="pairwise.complete.obs")["y1_t", "y1_t"]
+
+alpha = (k*cov_tkr_y1t_y)/cov_tkr_y1t_y1t
+
+corrected_beta = beta.naive_tkr-alpha; corrected_beta
+```
+
+```{r}
+# Perform clustered bootstrapping to derive 95% confidence interval for corrected estimate (1000 bootstrapped sample)
+library(boot)
+
+TKR_dat_naive2=TKR_dat_naive %>% 
+  mutate(y1t = y1c*yearc)
+
+wide_TKR_dat_naive2 = TKR_dat_naive2 %>% 
+  select(id, y, y1c, yearc, y1t) %>% 
+  pivot_wider(id_cols=id,values_from = c(y, y1c, y1t),names_from=yearc)
+
+## Write a bootstrap function 
+my.boot <- function(data, id){
+  # Resample subjects
+  dt <- data[id, ]
+  # Create a new id variable and drop the old id
+  dt$id = NULL
+  dt$id = seq(1,nrow(dt))
+  # Convert to the long format for model fitting
+  dlong0 = pivot_longer(dt,cols=!id,
+                    names_to=c("vars","yearc"),
+                    names_sep="_",values_to = "y") %>% 
+    mutate(yearc=as.numeric(yearc))
+  dlong = pivot_wider(dlong0,names_from="vars",values_from="y")
+  # Fit the mean model
+  fit = lm(y~yearc*y1c, data=dlong)
+  
+  beta.naive_tkr=coef(fit)[4]
+  
+  cov_tkr_y1t_y = cov(dlong, use="pairwise.complete.obs")["y1t", "y"]
+  cov_tkr_y1t_y1t = cov(dlong, use="pairwise.complete.obs")["y1t", "y1t"]
+
+  alpha = (k*cov_tkr_y1t_y)/cov_tkr_y1t_y1t
+
+  corrected_beta = beta.naive_tkr-alpha
+  
+  corrected_beta
+}
+
+set.seed(123)
+result = boot(wide_TKR_dat_naive2, my.boot, 1000)
+
+boot_ci <- boot.ci(result, type = "perc")$perc[4:5]
+boot_ci # 0.054, 0.083
+```
+
+# Sensitivity analysis for corrected estimate - try different k values
+```{r}
+# Try different k values and get corrected estimates
+k_vec = c(0.50, 0.63, 0.7, 0.8, 0.9, 1.0)
+
+alpha_vec = (k_vec*cov_tkr_y1t_y)/cov_tkr_y1t_y1t
+
+corrected_beta_vec = beta.naive_tkr-alpha_vec; corrected_beta_vec
+```
+
+```{r}
+# Perform clustered bootstrapping to derive 95% confidence intervals for corrected estimates using different `k`s (1000 bootstrapped sample)
+library(boot)
+
+TKR_dat_naive2=TKR_dat_naive %>% 
+  mutate(y1t = y1c*yearc)
+
+wide_TKR_dat_naive2 = TKR_dat_naive2 %>% 
+  select(id, y, y1c, yearc, y1t) %>% 
+  pivot_wider(id_cols=id,values_from = c(y, y1c, y1t),names_from=yearc)
+
+## Write a bootstrap function 
+my.boot <- function(data, id){
+  # Resample the children
+  dt <- data[id, ]
+  # Create a new id variable and drop the old id
+  dt$id = NULL
+  dt$id = seq(1,nrow(dt))
+  # Convert to the long format for model fitting
+  dlong0 = pivot_longer(dt,cols=!id,
+                    names_to=c("vars","yearc"),
+                    names_sep="_",values_to = "y") %>% 
+    mutate(yearc=as.numeric(yearc))
+  dlong = pivot_wider(dlong0,names_from="vars",values_from="y")
+  # Fit the mean model
+  fit = lm(y~yearc*y1c, data=dlong)
+  
+  beta.naive_tkr=coef(fit)[4]
+  
+  cov_tkr_y1t_y = cov(dlong, use="pairwise.complete.obs")["y1t", "y"]
+  cov_tkr_y1t_y1t = cov(dlong, use="pairwise.complete.obs")["y1t", "y1t"]
+
+  alpha = (k_vec*cov_tkr_y1t_y)/cov_tkr_y1t_y1t
+
+  corrected_beta_vec = beta.naive_tkr-alpha_vec
+  
+  corrected_beta_vec
+}
+
+set.seed(123)
+result = boot(wide_TKR_dat_naive2, my.boot, 1000)
+
+boot_ci <- sapply(1:6, function(x) boot.ci(result, index = x, type = "perc")$perc[4:5])
+boot_ci
+```
+
+```{r}
+# Combine k values, corrected estimates and the corresponding confidence intervals and form a dataset
+k_plot_dat = as_tibble(cbind(k_vec, corrected_beta_vec, t(boot_ci))) %>% 
+  rename(LB = V3, UB = V4, mean=corrected_beta_vec, k=k_vec) %>% 
+  mutate(highlight=ifelse(k==0.63, 1,0)) 
+
+# Make error bar plot of corrected estimate of time-baseline interaction against `k` (`k` value derived using data from OAI group is highlighted in red)
+k_plot_dat %>% 
+  ggplot(aes(x=k, y=mean, col=factor(highlight)))+
+  geom_point()+
+  geom_line()+
+  geom_errorbar(aes(ymin=LB, ymax=UB), width=0.008)+
+  scale_x_continuous(breaks=k_vec)+
+  scale_color_manual(values = c("red","black"), breaks=c(1,0))+
+  labs(x = "k", y = "Corrected Estimate")+
+  theme_bw()+
+  theme(legend.position = "none")
+
+ggsave("k_plot.png")
+```
+
+
+
+
+
+
