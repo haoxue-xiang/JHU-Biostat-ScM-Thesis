@@ -4,8 +4,8 @@ R codes for Haoxue's JHU ScM Thesis: Evaluating the Effect of Baseline on the Ra
 In the **Simulations** folder:
 
 - **simulations.Rmd**: Codes for simulations of the correction approach (numeric values of naive, RCT and corrected estimates) under Scenarios 1-15 in Chapter 4.
-- **truth.Rmd**: Codes for simulations of the correction approach (numeric values of true estimates) under Scenario 1-15 in Chapter 4. 
-- **simulations_figures.Rmd**: Codes for simulations of the correction approach (figures) under Scenario 1-15 in Chapter 4.
+- **truth.Rmd**: Codes for simulations of the correction approach (numeric values of true estimates) under Scenarios 1-15 in Chapter 4. 
+- **simulations_figures.Rmd**: Codes for simulations of the correction approach (figures) under Scenarios 1-15 in Chapter 4.
 - **single_case.Rmd**: Codes for applying the correction approach to a single simulated sample (For exploring the simulation codes only).
 
 In the **Case Study** folder:
