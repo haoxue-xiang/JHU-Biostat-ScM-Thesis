@@ -1,0 +1,948 @@
+---
+title: "Simulations"
+output: html_document
+date: "2024-01-04"
+---
+
+```{r}
+library(MASS)
+library(lme4)
+library(nlme)
+library(tidyverse)
+library(parallel)
+library(doParallel)
+library(foreach)
+library(gee)
+```
+
+```{r}
+# Parallel running
+if (length(showConnections()) > 0) closeAllConnections()
+ncores=detectCores()
+cl <- makeCluster(ncores)  
+registerDoParallel(cl)
+```
+
+```{r}
+# Correlation structure
+# Exchangeable
+exch_cor <- function(n, sigma, rho){
+  covmat <- rho * outer(sigma, sigma, `*`)
+  diag(covmat) <- sigma^2
+  return(covmat)
+}
+
+# AR1
+ar1_cor <- function(n, sigma, rho){
+  rhomat <- rho^abs(outer(1:n, 1:n, `-`))
+  covmat <- rhomat*outer(sigma, sigma, `*`)
+  diag(covmat) <- sigma^2
+  return(covmat)
+}
+
+# Correlation term (alpha3)
+corr_term = function(numer, denom){
+  return(numer/denom)
+}
+
+# Convert data to long (full) configuration
+# Scale baseline value and center time
+convert_long = function(id, time1, y, p){
+  datay = data.frame(id, time1, y)
+  y1 = rep(datay[datay$time1==0,]$y, each=p)
+
+  ydata_long = datay %>% 
+    mutate(y1=y1) %>% 
+    mutate(y.1 = scale(y1)[,1]) %>% 
+    mutate(timec = time1 - mean(time1))
+  return(ydata_long)
+}
+```
+
+# Write simulation into a whole function
+
+```{r}
+# n: sample size
+# p: number of observations per subject
+# nsim: number of simulations
+# alpha: parameter of fixed effects
+# D: Covariance matrix of random effect
+# R: Covariance matrix of residuals
+# convert_long: function that converts data to long (full) configuration
+
+# Function used to obtain k1 through simulations
+true_k_est <- function(n,p,nsim, alpha, D, R, convert_long){
+
+id = rep(1:n, each=p)
+time1 = rep(0:(p-1),n)
+
+# Fixed effect `alpha` in equation 3.1.
+# `t` represents treatment group and `c` represents control group
+alpha_t=alpha$alpha_t
+alpha_c=alpha$alpha_c
+
+if (is.null(alpha_t) & is.null(alpha_c)){
+  stop("Please specify fixed effect.")
+} else if (is.null(alpha_t)){
+  alpha_t = alpha_c
+} else if (is.null(alpha_c)){
+  alpha_c = alpha_t
+}
+
+# Covariance matrix `D` of random effect `b` in equation 3.1.
+# `t` represents treatment group and `c` represents control group
+D_t = D$D_t
+D_c = D$D_c
+
+if (is.null(D_t) & is.null(D_c)){
+  stop("Please specify covariance matrix of random effect.")
+} else if (is.null(D_t)){
+  D_t = D_c
+} else if (is.null(D_c)){
+  D_c = D_t
+}
+
+# Covariance matrix `R` of residuals `e` in equation 3.1.
+# `t` represents treatment group and `c` represents control group
+R_t = R$R_t
+R_c = R$R_c
+
+if (ncol(R_t) != p | ncol(R_c) != p){
+  stop("The dimension of covariance matrix of residuals is not equal to the number of observations per subjects.")
+}
+
+if (is.null(R_t) & is.null(R_c)){
+  stop("Please specify covariance matrix of residuals.")
+} else if (is.null(R_t)){
+  R_t = R_c
+} else if (is.null(R_c)){
+  R_c = R_t
+}
+
+# Treatment indicator (1: Treatment, 0: Control)
+tx=rep(c(1,0), each=(p*n))
+  
+beta <- matrix(NA, nsim, 2)
+
+beta <- foreach (i = 1:nsim, .combine=rbind, .packages=c("dplyr","tidyverse", "MASS")) %dopar% {
+  Zt = mvrnorm(n, c(0,0), D_t)
+  b0it=Zt[,1] # Random intercepts in treatment group 
+  b1it=Zt[,2] # Random slopes in treatment group
+  
+  Zc = mvrnorm(n, c(0,0), D_c)
+  b0ic=Zc[,1] # Random intercepts in control group
+  b1ic=Zc[,2] # Random slopes in control group
+  
+  epsilon_t = mvrnorm(n, rep(0,p), R_t) # Residuals in treatment group
+  epsilon_c = mvrnorm(n, rep(0,p), R_c) # Residuals in control group
+  
+  # Create response values for treatment and control group
+  yt = (alpha_t[1]+b0it[id]) + (alpha_t[2]+b1it[id])*time1 + c(t(epsilon_t))
+  yc = (alpha_c[1]+b0ic[id]) + (alpha_c[2]+b1ic[id])*time1 + c(t(epsilon_c))
+  
+  # Convert data to long (full) configuration for treatment and control group
+  ydata_long = convert_long(id,time1,yt,p)
+  ydata_long0 = convert_long(id,time1,yc,p)
+  
+  # Create Y_1*T variable in equation 2.14 for treatment and control group 
+  ydata_long1 = ydata_long %>% mutate(y1_t =y.1*timec)
+  cov_mat_trt = cov(ydata_long1)
+  ydata_long01 = ydata_long0 %>% mutate(y1_t =y.1*timec)
+  cov_mat_cont = cov(ydata_long01)
+  
+  # Calculate Cov(Y_1*T, Y) for treatment and control group
+  y1_t_y_c = cov_mat_cont["y1_t", "y"]
+  y1_t_y_t = cov_mat_trt["y1_t", "y"]
+  
+  # Cov(Y_1*T, Y) for treatment group, Cov(Y_1*T, Y) for control group
+  c(y1_t_y_c=y1_t_y_c, y1_t_y_t=y1_t_y_t)
+}
+
+mean_obj=colMeans(beta) 
+return(mean_obj)
+}
+```
+
+```{r}
+# n: sample size
+# p: number of observations per subject
+# nsim: number of simulations
+# alpha: parameter of fixed effects
+# D: Covariance matrix of random effect
+# R: Covariance matrix of residuals
+# k1: Approximate true k through simulations (by Approach 1)
+# k2: k derived directly from model parameters (by Approach 2)
+# convert_long: function that converts data to long (full) configuration
+# corr_term: function that calculates alpha3
+
+# Function used to compare naive, RCT, and corrected estimates using two approaches
+corr_sim <- function(n,p,nsim, alpha, D, R, k1, k2, convert_long, corr_term){
+
+id = rep(1:n, each=p)
+time1 = rep(0:(p-1),n)
+
+# Fixed effect `alpha` in equation 3.1.
+# `t` represents treatment group and `c` represents control group
+alpha_t=alpha$alpha_t
+alpha_c=alpha$alpha_c
+
+if (is.null(alpha_t) & is.null(alpha_c)){
+  stop("Please specify fixed effect.")
+} else if (is.null(alpha_t)){
+  alpha_t = alpha_c
+} else if (is.null(alpha_c)){
+  alpha_c = alpha_t
+}
+
+# Covariance matrix `D` of random effect `b` in equation 3.1.
+# `t` represents treatment group and `c` represents control group
+D_t = D$D_t
+D_c = D$D_c
+
+if (is.null(D_t) & is.null(D_c)){
+  stop("Please specify covariance matrix of random effect.")
+} else if (is.null(D_t)){
+  D_t = D_c
+} else if (is.null(D_c)){
+  D_c = D_t
+}
+
+# Covariance matrix `R` of residuals `e` in equation 3.1.
+# `t` represents treatment group and `c` represents control group
+R_t = R$R_t
+R_c = R$R_c
+
+if (ncol(R_t) != p | ncol(R_c) != p){
+  stop("The dimension of covariance matrix of residuals is not equal to the number of observations per subjects.")
+}
+
+if (is.null(R_t) & is.null(R_c)){
+  stop("Please specify covariance matrix of residuals.")
+} else if (is.null(R_t)){
+  R_t = R_c
+} else if (is.null(R_c)){
+  R_c = R_t
+}
+
+# Treatment indicator (1: Treatment, 0: Control)
+tx=rep(c(1,0), each=(p*n))
+  
+beta <- matrix(NA, nsim, 4)
+
+beta <- foreach (i = 1:nsim, .combine=rbind, .packages=c("dplyr","tidyverse", "MASS", "gee")) %dopar% {
+  Zt = mvrnorm(n, c(0,0), D_t)
+  b0it=Zt[,1] # Random intercepts in treatment group 
+  b1it=Zt[,2] # Random slopes in treatment group
+  
+  Zc = mvrnorm(n, c(0,0), D_c)
+  b0ic=Zc[,1] # Random intercepts in control group
+  b1ic=Zc[,2] # Random slopes in control group
+
+  epsilon_t = mvrnorm(n, rep(0,p), R_t) # Residuals in treatment group
+  epsilon_c = mvrnorm(n, rep(0,p), R_c) # Residuals in control group
+  
+  # Create response values for treatment and control group
+  yt = (alpha_t[1]+b0it[id]) + (alpha_t[2]+b1it[id])*time1 + c(t(epsilon_t))
+  yc = (alpha_c[1]+b0ic[id]) + (alpha_c[2]+b1ic[id])*time1 + c(t(epsilon_c))
+  
+  # Convert data to long (full) configuration for treatment and control group
+  ydata_long = convert_long(id,time1,yt,p)
+  ydata_long0 = convert_long(id,time1,yc,p)
+  
+  # Combine data from treatment and control group
+  ytotal = rbind(ydata_long, ydata_long0)
+  
+  # Add treatment indicator variable 
+  ytotal2 = cbind(ytotal,tx)
+  
+  # Get naive estimate
+  mod.naive = gee(y~timec*y.1, data=ydata_long, id=id, corstr = "AR-M", Mv=1)
+  beta.naive=coef(mod.naive)[4]
+  
+  # Get RCT estimate
+  mod.rct =  gee(y~timec*y.1*tx, data=ytotal2, id=id, corstr = "AR-M", Mv=1)
+  beta.rct = coef(mod.rct)[8]
+  
+  # Create Y_1*T variable in equation 2.14 for treatment group
+  ydata_long1 = ydata_long %>% mutate(y1_t =y.1*timec)
+  cov_mat_trt = cov(ydata_long1)
+  
+  # Calculate correction term (alpha3) using k1
+  alpha3_1 = corr_term(numer=k1*cov_mat_trt["y1_t", "y"], denom=cov_mat_trt["y1_t", "y1_t"])
+  
+  # Get Corrected estimate using Approach 1 (k1)
+  beta.cor_1 = beta.naive-alpha3_1
+  
+  # Calculate correction term (alpha3) using k2
+  alpha3_2 = corr_term(numer=k2*cov_mat_trt["y1_t", "y"], denom=cov_mat_trt["y1_t", "y1_t"])
+  
+  # Get Corrected estimate using Approach 2 (k2)
+  beta.cor_2 = beta.naive-alpha3_2
+  
+  # Naive estimate, RCT estimate, Corrected estimate using Approach 1 and 2
+  c(beta.naive, beta.rct, beta.cor_1, beta.cor_2)
+}
+
+mean=colMeans(beta) 
+st_dev=apply(beta, 2, sd)
+
+result = rbind(mean,st_dev)
+return(result)
+}
+```
+
+
+# Reference Scenario (Scenario 1)
+```{r}
+# Fixed effect `alpha` in equation 3.1.
+alpha_t = c(55,4)
+alpha_c = c(55,2)
+
+# Covariance matrix `D` of random effect `b` in equation 3.1.
+sigma_int_t = 5.5
+sigma_int_c = 5.5
+sigma_time1_t = 3.5
+sigma_time1_c = 3.5
+corr_t = 0.3
+corr_c = 0.5
+D_t = matrix(c(sigma_int_t^2, corr_t*sigma_int_t*sigma_time1_t, corr_t*sigma_int_t*sigma_time1_t, sigma_time1_t^2), nrow=2)
+D_c = matrix(c(sigma_int_c^2, corr_c*sigma_int_c*sigma_time1_c, corr_c*sigma_int_c*sigma_time1_c, sigma_time1_c^2), nrow=2)
+
+# Get k directly from model parameters (k2)
+k2 = (corr_c*sigma_time1_c)/(corr_t*sigma_time1_t)
+
+# Covariance matrix `R` of residuals `e` in equation 3.1.
+p=3
+sd_t <- rep(2,p)
+rho_t <- 0.3
+sd_c = rep(2,p)
+rho_c = 0.3
+R_t=ar1_cor(p,sd_t,rho_t)
+R_c=ar1_cor(p,sd_c,rho_c)
+
+true_k_est_v = true_k_est(n=5000,p=3,nsim=10000, alpha=list(alpha_t=alpha_t, alpha_c=alpha_c), D=list(D_t=D_t, D_c=D_c), R=list(R_t=R_t, R_c=R_c), convert_long)
+
+# Estimate true k values through simulations (k1)
+k1 = true_k_est_v[1]/true_k_est_v[2]
+
+c(k1,k2)
+```
+
+
+```{r}
+# Naive, RCT, Corrected estimates using Approach 1 and 2
+corr_sim(n=200,p=3,nsim=1000, alpha=list(alpha_t=alpha_t, alpha_c=alpha_c), D=list(D_t=D_t, D_c=D_c), R=list(R_t=R_t, R_c=R_c), k1=k1, k2=k2, convert_long, corr_term)
+```
+
+
+# Perturbation of Fixed Effects
+
+## Scenario 2: alpha_c = (55,0)
+```{r}
+# Fixed effect `alpha` in equation 3.1.
+alpha_t = c(55,4)
+alpha_c = c(55,0)
+
+# Covariance matrix `D` of random effect `b` in equation 3.1.
+sigma_int_t = 5.5
+sigma_int_c = 5.5
+sigma_time1_t = 3.5
+sigma_time1_c = 3.5
+corr_t = 0.3
+corr_c = 0.5
+D_t = matrix(c(sigma_int_t^2, corr_t*sigma_int_t*sigma_time1_t, corr_t*sigma_int_t*sigma_time1_t, sigma_time1_t^2), nrow=2)
+D_c = matrix(c(sigma_int_c^2, corr_c*sigma_int_c*sigma_time1_c, corr_c*sigma_int_c*sigma_time1_c, sigma_time1_c^2), nrow=2)
+
+# Get k directly from model parameters (k2)
+k2 = (corr_c*sigma_time1_c)/(corr_t*sigma_time1_t)
+
+# Covariance matrix `R` of residuals `e` in equation 3.1.
+p=3
+sd_t <- rep(2,p)
+rho_t <- 0.3
+sd_c = rep(2,p)
+rho_c = 0.3
+R_t=ar1_cor(p,sd_t,rho_t)
+R_c=ar1_cor(p,sd_c,rho_c)
+
+true_k_est_v = true_k_est(n=1000,p=3,nsim=5000, alpha=list(alpha_t=alpha_t, alpha_c=alpha_c), D=list(D_t=D_t, D_c=D_c), R=list(R_t=R_t, R_c=R_c), convert_long)
+
+# Estimate true k values through simulations (k1)
+k1 = true_k_est_v[1]/true_k_est_v[2]
+
+c(k1,k2)
+```
+
+
+```{r}
+# Naive, RCT, Corrected estimates using Approach 1 and 2
+corr_sim(n=200,p=3,nsim=1000, alpha=list(alpha_t=alpha_t, alpha_c=alpha_c), D=list(D_t=D_t, D_c=D_c), R=list(R_t=R_t, R_c=R_c), k1=k1, k2=k2, convert_long, corr_term)
+```
+
+## Scenario 3: alpha_c = (55,-2)
+```{r}
+# Fixed effect `alpha` in equation 3.1.
+alpha_t = c(55,4)
+alpha_c = c(55,-2)
+
+# Covariance matrix `D` of random effect `b` in equation 3.1.
+sigma_int_t = 5.5
+sigma_int_c = 5.5
+sigma_time1_t = 3.5
+sigma_time1_c = 3.5
+corr_t = 0.3
+corr_c = 0.5
+D_t = matrix(c(sigma_int_t^2, corr_t*sigma_int_t*sigma_time1_t, corr_t*sigma_int_t*sigma_time1_t, sigma_time1_t^2), nrow=2)
+D_c = matrix(c(sigma_int_c^2, corr_c*sigma_int_c*sigma_time1_c, corr_c*sigma_int_c*sigma_time1_c, sigma_time1_c^2), nrow=2)
+
+# Get k directly from model parameters (k2)
+k2 = (corr_c*sigma_time1_c)/(corr_t*sigma_time1_t)
+
+# Covariance matrix `R` of residuals `e` in equation 3.1.
+p=3
+sd_t <- rep(2,p)
+rho_t <- 0.3
+sd_c = rep(2,p)
+rho_c = 0.3
+R_t=ar1_cor(p,sd_t,rho_t)
+R_c=ar1_cor(p,sd_c,rho_c)
+
+true_k_est_v = true_k_est(n=1000,p=3,nsim=5000, alpha=list(alpha_t=alpha_t, alpha_c=alpha_c), D=list(D_t=D_t, D_c=D_c), R=list(R_t=R_t, R_c=R_c), convert_long)
+
+# Estimate true k values through simulations (k1)
+k1 = true_k_est_v[1]/true_k_est_v[2]
+
+c(k1,k2)
+```
+
+```{r}
+# Naive, RCT, Corrected estimates using Approach 1 and 2
+corr_sim(n=200,p=3,nsim=1000, alpha=list(alpha_t=alpha_t, alpha_c=alpha_c), D=list(D_t=D_t, D_c=D_c), R=list(R_t=R_t, R_c=R_c), k1=k1, k2=k2, convert_long, corr_term)
+```
+
+## Scenario 4: alpha_c = (55,4)
+```{r}
+# Fixed effect `alpha` in equation 3.1.
+alpha_t = c(55,4)
+alpha_c = c(55,4)
+
+# Covariance matrix `D` of random effect `b` in equation 3.1.
+sigma_int_t = 5.5
+sigma_int_c = 5.5
+sigma_time1_t = 3.5
+sigma_time1_c = 3.5
+corr_t = 0.3
+corr_c = 0.5
+D_t = matrix(c(sigma_int_t^2, corr_t*sigma_int_t*sigma_time1_t, corr_t*sigma_int_t*sigma_time1_t, sigma_time1_t^2), nrow=2)
+D_c = matrix(c(sigma_int_c^2, corr_c*sigma_int_c*sigma_time1_c, corr_c*sigma_int_c*sigma_time1_c, sigma_time1_c^2), nrow=2)
+
+# Get k directly from model parameters (k2)
+k2 = (corr_c*sigma_time1_c)/(corr_t*sigma_time1_t)
+
+# Covariance matrix `R` of residuals `e` in equation 3.1.
+p=3
+sd_t <- rep(2,p)
+rho_t <- 0.3
+sd_c = rep(2,p)
+rho_c = 0.3
+R_t=ar1_cor(p,sd_t,rho_t)
+R_c=ar1_cor(p,sd_c,rho_c)
+
+true_k_est_v = true_k_est(n=1000,p=3,nsim=5000, alpha=list(alpha_t=alpha_t, alpha_c=alpha_c), D=list(D_t=D_t, D_c=D_c), R=list(R_t=R_t, R_c=R_c), convert_long)
+
+# Estimate true k values through simulations (k1)
+k1 = true_k_est_v[1]/true_k_est_v[2]
+
+c(k1,k2)
+```
+
+```{r}
+# Naive, RCT, Corrected estimates using Approach 1 and 2
+corr_sim(n=200,p=3,nsim=1000, alpha=list(alpha_t=alpha_t, alpha_c=alpha_c), D=list(D_t=D_t, D_c=D_c), R=list(R_t=R_t, R_c=R_c), k1=k1, k2=k2, convert_long, corr_term)
+```
+
+
+# Perturbation of Random Effects
+
+## Scenario 5: sigma_1 = 3.5 for treatment and sigma_1 = 2 for control group
+
+```{r}
+# Fixed effect `alpha` in equation 3.1.
+alpha_t = c(55,4)
+alpha_c = c(55,2)
+
+# Covariance matrix `D` of random effect `b` in equation 3.1.
+sigma_int_t = 5.5
+sigma_int_c = 5.5
+sigma_time1_t = 3.5
+sigma_time1_c = 2
+corr_t = 0.3
+corr_c = 0.5
+D_t = matrix(c(sigma_int_t^2, corr_t*sigma_int_t*sigma_time1_t, corr_t*sigma_int_t*sigma_time1_t, sigma_time1_t^2), nrow=2)
+D_c = matrix(c(sigma_int_c^2, corr_c*sigma_int_c*sigma_time1_c, corr_c*sigma_int_c*sigma_time1_c, sigma_time1_c^2), nrow=2)
+
+# Get k directly from model parameters (k2)
+k2 = (corr_c*sigma_time1_c)/(corr_t*sigma_time1_t)
+
+# Covariance matrix `R` of residuals `e` in equation 3.1.
+p=3
+sd_t <- rep(2,p)
+rho_t <- 0.3
+sd_c = rep(2,p)
+rho_c = 0.3
+R_t=ar1_cor(p,sd_t,rho_t)
+R_c=ar1_cor(p,sd_c,rho_c)
+
+true_k_est_v = true_k_est(n=1000,p=3,nsim=5000, alpha=list(alpha_t=alpha_t, alpha_c=alpha_c), D=list(D_t=D_t, D_c=D_c), R=list(R_t=R_t, R_c=R_c), convert_long)
+
+# Estimate true k values through simulations (k1)
+k1 = true_k_est_v[1]/true_k_est_v[2]
+
+c(k1,k2)
+```
+
+
+```{r}
+# Naive, RCT, Corrected estimates using Approach 1 and 2
+corr_sim(n=200,p=3,nsim=1000, alpha=list(alpha_t=alpha_t, alpha_c=alpha_c), D=list(D_t=D_t, D_c=D_c), R=list(R_t=R_t, R_c=R_c), k1=k1, k2=k2, convert_long, corr_term)
+```
+
+
+## Scenario 6: sigma_1 = 3.5 for treatment and sigma_1 = 2.5 for control group
+
+```{r}
+# Fixed effect `alpha` in equation 3.1.
+alpha_t = c(55,4)
+alpha_c = c(55,2)
+
+# Covariance matrix `D` of random effect `b` in equation 3.1.
+sigma_int_t = 5.5
+sigma_int_c = 5.5
+sigma_time1_t = 3.5
+sigma_time1_c = 2.5
+corr_t = 0.3
+corr_c = 0.5
+D_t = matrix(c(sigma_int_t^2, corr_t*sigma_int_t*sigma_time1_t, corr_t*sigma_int_t*sigma_time1_t, sigma_time1_t^2), nrow=2)
+D_c = matrix(c(sigma_int_c^2, corr_c*sigma_int_c*sigma_time1_c, corr_c*sigma_int_c*sigma_time1_c, sigma_time1_c^2), nrow=2)
+
+# Get k directly from model parameters (k2)
+k2 = (corr_c*sigma_time1_c)/(corr_t*sigma_time1_t)
+
+# Covariance matrix `R` of residuals `e` in equation 3.1.
+p=3
+sd_t <- rep(2,p)
+rho_t <- 0.3
+sd_c = rep(2,p)
+rho_c = 0.3
+R_t=ar1_cor(p,sd_t,rho_t)
+R_c=ar1_cor(p,sd_c,rho_c)
+
+true_k_est_v = true_k_est(n=1000,p=3,nsim=5000, alpha=list(alpha_t=alpha_t, alpha_c=alpha_c), D=list(D_t=D_t, D_c=D_c), R=list(R_t=R_t, R_c=R_c), convert_long)
+
+# Estimate true k values through simulations (k1)
+k1 = true_k_est_v[1]/true_k_est_v[2]
+
+c(k1,k2)
+```
+
+```{r}
+# Naive, RCT, Corrected estimates using Approach 1 and 2
+corr_sim(n=200,p=3,nsim=1000, alpha=list(alpha_t=alpha_t, alpha_c=alpha_c), D=list(D_t=D_t, D_c=D_c), R=list(R_t=R_t, R_c=R_c), k1=k1, k2=k2, convert_long, corr_term)
+```
+
+
+## Scenario 7: sigma_1 = 3.5 for treatment and sigma_1 = 4 for control group
+
+```{r}
+# Fixed effect `alpha` in equation 3.1.
+alpha_t = c(55,4)
+alpha_c = c(55,2)
+
+# Covariance matrix `D` of random effect `b` in equation 3.1.
+sigma_int_t = 5.5
+sigma_int_c = 5.5
+sigma_time1_t = 3.5
+sigma_time1_c = 4
+corr_t = 0.3
+corr_c = 0.5
+D_t = matrix(c(sigma_int_t^2, corr_t*sigma_int_t*sigma_time1_t, corr_t*sigma_int_t*sigma_time1_t, sigma_time1_t^2), nrow=2)
+D_c = matrix(c(sigma_int_c^2, corr_c*sigma_int_c*sigma_time1_c, corr_c*sigma_int_c*sigma_time1_c, sigma_time1_c^2), nrow=2)
+
+# Get k directly from model parameters (k2)
+k2 = (corr_c*sigma_time1_c)/(corr_t*sigma_time1_t)
+
+# Covariance matrix `R` of residuals `e` in equation 3.1.
+p=3
+sd_t <- rep(2,p)
+rho_t <- 0.3
+sd_c = rep(2,p)
+rho_c = 0.3
+R_t=ar1_cor(p,sd_t,rho_t)
+R_c=ar1_cor(p,sd_c,rho_c)
+
+true_k_est_v = true_k_est(n=1000,p=3,nsim=5000, alpha=list(alpha_t=alpha_t, alpha_c=alpha_c), D=list(D_t=D_t, D_c=D_c), R=list(R_t=R_t, R_c=R_c), convert_long)
+
+# Estimate true k values through simulations (k1)
+k1 = true_k_est_v[1]/true_k_est_v[2]
+
+c(k1,k2)
+```
+
+
+```{r}
+# Naive, RCT, Corrected estimates using Approach 1 and 2
+corr_sim(n=200,p=3,nsim=1000, alpha=list(alpha_t=alpha_t, alpha_c=alpha_c), D=list(D_t=D_t, D_c=D_c), R=list(R_t=R_t, R_c=R_c), k1=k1, k2=k2, convert_long, corr_term)
+```
+
+
+## Scenario 8: rho = 0.3 for treatment and rho = 0.6 for control group
+
+```{r}
+# Fixed effect `alpha` in equation 3.1.
+alpha_t = c(55,4)
+alpha_c = c(55,2)
+
+# Covariance matrix `D` of random effect `b` in equation 3.1.
+sigma_int_t = 5.5
+sigma_int_c = 5.5
+sigma_time1_t = 3.5
+sigma_time1_c = 3.5
+corr_t = 0.3
+corr_c = 0.6
+D_t = matrix(c(sigma_int_t^2, corr_t*sigma_int_t*sigma_time1_t, corr_t*sigma_int_t*sigma_time1_t, sigma_time1_t^2), nrow=2)
+D_c = matrix(c(sigma_int_c^2, corr_c*sigma_int_c*sigma_time1_c, corr_c*sigma_int_c*sigma_time1_c, sigma_time1_c^2), nrow=2)
+
+# Get k directly from model parameters (k2)
+k2 = (corr_c*sigma_time1_c)/(corr_t*sigma_time1_t)
+
+# Covariance matrix `R` of residuals `e` in equation 3.1.
+p=3
+sd_t <- rep(2,p)
+rho_t <- 0.3
+sd_c = rep(2,p)
+rho_c = 0.3
+R_t=ar1_cor(p,sd_t,rho_t)
+R_c=ar1_cor(p,sd_c,rho_c)
+
+true_k_est_v = true_k_est(n=1000,p=3,nsim=5000, alpha=list(alpha_t=alpha_t, alpha_c=alpha_c), D=list(D_t=D_t, D_c=D_c), R=list(R_t=R_t, R_c=R_c), convert_long)
+
+# Estimate true k values through simulations (k1)
+k1 = true_k_est_v[1]/true_k_est_v[2]
+
+c(k1,k2)
+```
+
+
+```{r}
+# Naive, RCT, Corrected estimates using Approach 1 and 2
+corr_sim(n=200,p=3,nsim=1000, alpha=list(alpha_t=alpha_t, alpha_c=alpha_c), D=list(D_t=D_t, D_c=D_c), R=list(R_t=R_t, R_c=R_c), k1=k1, k2=k2, convert_long, corr_term)
+```
+
+## Scenario 9: rho = 0.3 for treatment and rho = 0.3 for control group
+
+```{r}
+# Fixed effect `alpha` in equation 3.1.
+alpha_t = c(55,4)
+alpha_c = c(55,2)
+
+# Covariance matrix `D` of random effect `b` in equation 3.1.
+sigma_int_t = 5.5
+sigma_int_c = 5.5
+sigma_time1_t = 3.5
+sigma_time1_c = 3.5
+corr_t = 0.3
+corr_c = 0.3
+D_t = matrix(c(sigma_int_t^2, corr_t*sigma_int_t*sigma_time1_t, corr_t*sigma_int_t*sigma_time1_t, sigma_time1_t^2), nrow=2)
+D_c = matrix(c(sigma_int_c^2, corr_c*sigma_int_c*sigma_time1_c, corr_c*sigma_int_c*sigma_time1_c, sigma_time1_c^2), nrow=2)
+
+# Get k directly from model parameters (k2)
+k2 = (corr_c*sigma_time1_c)/(corr_t*sigma_time1_t)
+
+# Covariance matrix `R` of residuals `e` in equation 3.1.
+p=3
+sd_t <- rep(2,p)
+rho_t <- 0.3
+sd_c = rep(2,p)
+rho_c = 0.3
+R_t=ar1_cor(p,sd_t,rho_t)
+R_c=ar1_cor(p,sd_c,rho_c)
+
+true_k_est_v = true_k_est(n=1000,p=3,nsim=5000, alpha=list(alpha_t=alpha_t, alpha_c=alpha_c), D=list(D_t=D_t, D_c=D_c), R=list(R_t=R_t, R_c=R_c), convert_long)
+
+# Estimate true k values through simulations (k1)
+k1 = true_k_est_v[1]/true_k_est_v[2]
+
+c(k1,k2)
+```
+
+```{r}
+# Naive, RCT, Corrected estimates using Approach 1 and 2
+corr_sim(n=200,p=3,nsim=1000, alpha=list(alpha_t=alpha_t, alpha_c=alpha_c), D=list(D_t=D_t, D_c=D_c), R=list(R_t=R_t, R_c=R_c), k1=k1, k2=k2, convert_long, corr_term)
+```
+
+
+## Scenario 10: rho = 0.3 for treatment and rho = 0.2 for control group
+
+```{r}
+# Fixed effect `alpha` in equation 3.1.
+alpha_t = c(55,4)
+alpha_c = c(55,2)
+
+# Covariance matrix `D` of random effect `b` in equation 3.1.
+sigma_int_t = 5.5
+sigma_int_c = 5.5
+sigma_time1_t = 3.5
+sigma_time1_c = 3.5
+corr_t = 0.3
+corr_c = 0.2
+D_t = matrix(c(sigma_int_t^2, corr_t*sigma_int_t*sigma_time1_t, corr_t*sigma_int_t*sigma_time1_t, sigma_time1_t^2), nrow=2)
+D_c = matrix(c(sigma_int_c^2, corr_c*sigma_int_c*sigma_time1_c, corr_c*sigma_int_c*sigma_time1_c, sigma_time1_c^2), nrow=2)
+
+# Get k directly from model parameters (k2)
+k2 = (corr_c*sigma_time1_c)/(corr_t*sigma_time1_t)
+
+# Covariance matrix `R` of residuals `e` in equation 3.1.
+p=3
+sd_t <- rep(2,p)
+rho_t <- 0.3
+sd_c = rep(2,p)
+rho_c = 0.3
+R_t=ar1_cor(p,sd_t,rho_t)
+R_c=ar1_cor(p,sd_c,rho_c)
+
+true_k_est_v = true_k_est(n=1000,p=3,nsim=5000, alpha=list(alpha_t=alpha_t, alpha_c=alpha_c), D=list(D_t=D_t, D_c=D_c), R=list(R_t=R_t, R_c=R_c), convert_long)
+
+# Estimate true k values through simulations (k1)
+k1 = true_k_est_v[1]/true_k_est_v[2]
+
+c(k1,k2)
+```
+
+
+```{r}
+# Naive, RCT, Corrected estimates using Approach 1 and 2
+corr_sim(n=200,p=3,nsim=1000, alpha=list(alpha_t=alpha_t, alpha_c=alpha_c), D=list(D_t=D_t, D_c=D_c), R=list(R_t=R_t, R_c=R_c), k1=k1, k2=k2, convert_long, corr_term)
+```
+
+
+# Perturbation of Residuals
+
+## Scenario 11: sigma_r1=sigma_r2=sigma_r3=2 for treatment, sigma_r1=2, sigma_r2=2.5, sigma_r3=3 for control
+
+```{r}
+# Fixed effect `alpha` in equation 3.1.
+alpha_t = c(55,4)
+alpha_c = c(55,2)
+
+# Covariance matrix `D` of random effect `b` in equation 3.1.
+sigma_int_t = 5.5
+sigma_int_c = 5.5
+sigma_time1_t = 3.5
+sigma_time1_c = 3.5
+corr_t = 0.3
+corr_c = 0.5
+D_t = matrix(c(sigma_int_t^2, corr_t*sigma_int_t*sigma_time1_t, corr_t*sigma_int_t*sigma_time1_t, sigma_time1_t^2), nrow=2)
+D_c = matrix(c(sigma_int_c^2, corr_c*sigma_int_c*sigma_time1_c, corr_c*sigma_int_c*sigma_time1_c, sigma_time1_c^2), nrow=2)
+
+# Get k directly from model parameters (k2)
+k2 = (corr_c*sigma_time1_c)/(corr_t*sigma_time1_t)
+
+# Covariance matrix `R` of residuals `e` in equation 3.1.
+p=3
+sd_t <- rep(2,p)
+rho_t <- 0.3
+sd_c = c(2,2.5,3)
+rho_c = 0.3
+R_t=ar1_cor(p,sd_t,rho_t)
+R_c=ar1_cor(p,sd_c,rho_c)
+
+true_k_est_v = true_k_est(n=1000,p=3,nsim=5000, alpha=list(alpha_t=alpha_t, alpha_c=alpha_c), D=list(D_t=D_t, D_c=D_c), R=list(R_t=R_t, R_c=R_c), convert_long)
+
+# Estimate true k values through simulations (k1)
+k1 = true_k_est_v[1]/true_k_est_v[2]
+
+c(k1,k2)
+```
+
+
+```{r}
+# Naive, RCT, Corrected estimates using Approach 1 and 2
+corr_sim(n=200,p=3,nsim=1000, alpha=list(alpha_t=alpha_t, alpha_c=alpha_c), D=list(D_t=D_t, D_c=D_c), R=list(R_t=R_t, R_c=R_c), k1=k1, k2=k2, convert_long, corr_term)
+```
+
+
+## Scenario 12: sigma_r1=sigma_r2=sigma_r3=2 for treatment, sigma_r1=2, sigma_r2=1.5, sigma_r3=1 for control
+
+```{r}
+# Fixed effect `alpha` in equation 3.1.
+alpha_t = c(55,4)
+alpha_c = c(55,2)
+
+# Covariance matrix `D` of random effect `b` in equation 3.1.
+sigma_int_t = 5.5
+sigma_int_c = 5.5
+sigma_time1_t = 3.5
+sigma_time1_c = 3.5
+corr_t = 0.3
+corr_c = 0.5
+D_t = matrix(c(sigma_int_t^2, corr_t*sigma_int_t*sigma_time1_t, corr_t*sigma_int_t*sigma_time1_t, sigma_time1_t^2), nrow=2)
+D_c = matrix(c(sigma_int_c^2, corr_c*sigma_int_c*sigma_time1_c, corr_c*sigma_int_c*sigma_time1_c, sigma_time1_c^2), nrow=2)
+
+# Get k directly from model parameters (k2)
+k2 = (corr_c*sigma_time1_c)/(corr_t*sigma_time1_t)
+
+# Covariance matrix `R` of residuals `e` in equation 3.1.
+p=3
+sd_t <- rep(2,p)
+rho_t <- 0.3
+sd_c = c(2,1.5,1)
+rho_c = 0.3
+R_t=ar1_cor(p,sd_t,rho_t)
+R_c=ar1_cor(p,sd_c,rho_c)
+
+true_k_est_v = true_k_est(n=1000,p=3,nsim=5000, alpha=list(alpha_t=alpha_t, alpha_c=alpha_c), D=list(D_t=D_t, D_c=D_c), R=list(R_t=R_t, R_c=R_c), convert_long)
+
+# Estimate true k values through simulations (k1)
+k1 = true_k_est_v[1]/true_k_est_v[2]
+
+c(k1,k2)
+```
+
+
+```{r}
+# Naive, RCT, Corrected estimates using Approach 1 and 2
+corr_sim(n=200,p=3,nsim=1000, alpha=list(alpha_t=alpha_t, alpha_c=alpha_c), D=list(D_t=D_t, D_c=D_c), R=list(R_t=R_t, R_c=R_c), k1=k1, k2=k2, convert_long, corr_term)
+```
+
+## Scenario 13: sigma_r1=sigma_r2=sigma_r3=2 for treatment, sigma_r1=2, sigma_r2=2, sigma_r3=2 for control. rho_r for control = 0.4.
+
+```{r}
+# Fixed effect `alpha` in equation 3.1.
+alpha_t = c(55,4)
+alpha_c = c(55,2)
+
+# Covariance matrix `D` of random effect `b` in equation 3.1.
+sigma_int_t = 5.5
+sigma_int_c = 5.5
+sigma_time1_t = 3.5
+sigma_time1_c = 3.5
+corr_t = 0.3
+corr_c = 0.5
+D_t = matrix(c(sigma_int_t^2, corr_t*sigma_int_t*sigma_time1_t, corr_t*sigma_int_t*sigma_time1_t, sigma_time1_t^2), nrow=2)
+D_c = matrix(c(sigma_int_c^2, corr_c*sigma_int_c*sigma_time1_c, corr_c*sigma_int_c*sigma_time1_c, sigma_time1_c^2), nrow=2)
+
+# Get k directly from model parameters (k2)
+k2 = (corr_c*sigma_time1_c)/(corr_t*sigma_time1_t)
+
+# Covariance matrix `R` of residuals `e` in equation 3.1.
+p=3
+sd_t <- rep(2,p)
+rho_t <- 0.3
+sd_c = rep(2,p)
+rho_c = 0.4
+R_t=ar1_cor(p,sd_t,rho_t)
+R_c=ar1_cor(p,sd_c,rho_c)
+
+true_k_est_v = true_k_est(n=1000,p=3,nsim=5000, alpha=list(alpha_t=alpha_t, alpha_c=alpha_c), D=list(D_t=D_t, D_c=D_c), R=list(R_t=R_t, R_c=R_c), convert_long)
+
+# Estimate true k values through simulations (k1)
+k1 = true_k_est_v[1]/true_k_est_v[2]
+
+c(k1,k2)
+```
+
+
+```{r}
+# Naive, RCT, Corrected estimates using Approach 1 and 2
+corr_sim(n=200,p=3,nsim=1000, alpha=list(alpha_t=alpha_t, alpha_c=alpha_c), D=list(D_t=D_t, D_c=D_c), R=list(R_t=R_t, R_c=R_c), k1=k1, k2=k2, convert_long, corr_term)
+```
+
+
+## Scenario 14: sigma_r1=sigma_r2=sigma_r3=2 for treatment, sigma_r1=2, sigma_r2=2, sigma_r3=2 for control. rho_r for control = 0.2.
+
+```{r}
+# Fixed effect `alpha` in equation 3.1.
+alpha_t = c(55,4)
+alpha_c = c(55,2)
+
+# Covariance matrix `D` of random effect `b` in equation 3.1.
+sigma_int_t = 5.5
+sigma_int_c = 5.5
+sigma_time1_t = 3.5
+sigma_time1_c = 3.5
+corr_t = 0.3
+corr_c = 0.5
+D_t = matrix(c(sigma_int_t^2, corr_t*sigma_int_t*sigma_time1_t, corr_t*sigma_int_t*sigma_time1_t, sigma_time1_t^2), nrow=2)
+D_c = matrix(c(sigma_int_c^2, corr_c*sigma_int_c*sigma_time1_c, corr_c*sigma_int_c*sigma_time1_c, sigma_time1_c^2), nrow=2)
+
+# Get k directly from model parameters (k2)
+k2 = (corr_c*sigma_time1_c)/(corr_t*sigma_time1_t)
+
+# Covariance matrix `R` of residuals `e` in equation 3.1.
+p=3
+sd_t <- rep(2,p)
+rho_t <- 0.3
+sd_c = rep(2,p)
+rho_c = 0.2
+R_t=ar1_cor(p,sd_t,rho_t)
+R_c=ar1_cor(p,sd_c,rho_c)
+
+true_k_est_v = true_k_est(n=1000,p=3,nsim=5000, alpha=list(alpha_t=alpha_t, alpha_c=alpha_c), D=list(D_t=D_t, D_c=D_c), R=list(R_t=R_t, R_c=R_c), convert_long)
+
+# Estimate true k values through simulations (k1)
+k1 = true_k_est_v[1]/true_k_est_v[2]
+
+c(k1,k2)
+```
+
+
+```{r}
+# Naive, RCT, Corrected estimates using Approach 1 and 2
+corr_sim(n=200,p=3,nsim=1000, alpha=list(alpha_t=alpha_t, alpha_c=alpha_c), D=list(D_t=D_t, D_c=D_c), R=list(R_t=R_t, R_c=R_c), k1=k1, k2=k2, convert_long, corr_term)
+```
+
+
+## Scenario 15: Exchangeable correlation, sigma_r1 = sigma_r2 = sigma_r3 = 2, rho_r = 0.3
+
+```{r}
+# Fixed effect `alpha` in equation 3.1.
+alpha_t = c(55,4)
+alpha_c = c(55,2)
+
+# Covariance matrix `D` of random effect `b` in equation 3.1.
+sigma_int_t = 5.5
+sigma_int_c = 5.5
+sigma_time1_t = 3.5
+sigma_time1_c = 3.5
+corr_t = 0.3
+corr_c = 0.5
+D_t = matrix(c(sigma_int_t^2, corr_t*sigma_int_t*sigma_time1_t, corr_t*sigma_int_t*sigma_time1_t, sigma_time1_t^2), nrow=2)
+D_c = matrix(c(sigma_int_c^2, corr_c*sigma_int_c*sigma_time1_c, corr_c*sigma_int_c*sigma_time1_c, sigma_time1_c^2), nrow=2)
+
+# Get k directly from model parameters (k2)
+k2 = (corr_c*sigma_time1_c)/(corr_t*sigma_time1_t)
+
+# Covariance matrix `R` of residuals `e` in equation 3.1.
+p=3
+sd_t <- rep(2,p)
+rho_t <- 0.3
+sd_c = rep(2,p)
+rho_c = 0.3
+R_t=exch_cor(p,sd_t,rho_t)
+R_c=exch_cor(p,sd_c,rho_c)
+
+true_k_est_v = true_k_est(n=1000,p=3,nsim=5000, alpha=list(alpha_t=alpha_t, alpha_c=alpha_c), D=list(D_t=D_t, D_c=D_c), R=list(R_t=R_t, R_c=R_c), convert_long)
+
+# Estimate true k values through simulations (k1)
+k1 = true_k_est_v[1]/true_k_est_v[2]
+
+c(k1,k2)
+```
+
+
+```{r}
+# Naive, RCT, Corrected estimates using Approach 1 and 2
+corr_sim(n=200,p=3,nsim=1000, alpha=list(alpha_t=alpha_t, alpha_c=alpha_c), D=list(D_t=D_t, D_c=D_c), R=list(R_t=R_t, R_c=R_c), k1=k1, k2=k2, convert_long, corr_term)
+```
+
+
