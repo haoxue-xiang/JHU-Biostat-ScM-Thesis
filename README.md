@@ -1,5 +1,5 @@
 # JHU-ScM-Thesis
-R codes for Haoxue's JHU Biostat ScM Thesis: Evaluating the Effect of Baseline on the Rate of Recovery from a Stressor in Single-Arm Studies of Resilience.
+R codes for Haoxue Xiang's JHU Biostat ScM Thesis: Evaluating the Effect of Baseline on the Rate of Recovery from a Stressor in Single-Arm Studies of Resilience.
 
 In the **Simulations** folder:
 
